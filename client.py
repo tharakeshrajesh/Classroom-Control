@@ -21,6 +21,7 @@ import time
 import sys
 import os
 import tempfile
+from pynput import keyboard
 
 try:
     from pynput import keyboard as kb, mouse as ms
@@ -35,22 +36,27 @@ except ImportError:
     sys.exit(1)
 
 # ── !! CONFIGURATION – edit these if needed !! ───────────────────────────────
-MASTER_IP       = "10.236.10.113"   # Static IP of the teacher/master PC
+MASTER_IP_LIST  = [
+    "10.236.21.222",
+
+]
 MASTER_PORT     = 9000
 WIFI_SSID       = "OPSB-ARUBA"
 WIFI_PASSWORD   = "opsbaruba"
-RECONNECT_DELAY = 8                 # seconds between reconnect attempts
+RECONNECT_DELAY = 8
 # ─────────────────────────────────────────────────────────────────────────────
 
 BUFFER = 1024
 
 # ── Global state ──────────────────────────────────────────────────────────────
-input_blocked  = False
-screen_blacked = False
-black_window   = None
-kb_listener    = None
-ms_listener    = None
-root           = None
+input_blocked     = False
+screen_blacked    = False
+enabled           = True
+black_window      = None
+kb_listener       = None
+ms_listener       = None
+root              = None
+mouse_lock_thread = None
 
 
 # ── Wi-Fi helper ──────────────────────────────────────────────────────────────
@@ -66,7 +72,7 @@ WIFI_PROFILE_XML = """<?xml version="1.0"?>
     <MSM>
         <security>
             <authEncryption>
-                <authentication>WPA2PSK</authentication>
+                <authentication>WPA3SAE</authentication>
                 <encryption>AES</encryption>
                 <useOneX>false</useOneX>
             </authEncryption>
@@ -123,22 +129,28 @@ def ensure_wifi():
 
 # ── Input blocking ────────────────────────────────────────────────────────────
 
+def _lock_mouse():
+    controller = ms.Controller()
+
+    while input_blocked:
+        controller.position = (0, 0)
+        time.sleep(0.01)
+
 def block_input():
-    global input_blocked, kb_listener, ms_listener
+    global input_blocked, mouse_lock_thread
+
     if input_blocked:
         return
-    input_blocked = True
-    kb_listener = kb.Listener(suppress=True)
-    ms_listener = ms.Listener(
-        on_move=lambda *a: False,
-        on_click=lambda *a: False,
-        on_scroll=lambda *a: False,
-        suppress=True,
-    )
-    kb_listener.start()
-    ms_listener.start()
-    print("[CLIENT] Input BLOCKED")
 
+    input_blocked = True
+
+    mouse_lock_thread = threading.Thread(
+        target=_lock_mouse,
+        daemon=True
+    )
+    mouse_lock_thread.start()
+
+    print("[CLIENT] Input BLOCKED")
 
 def unblock_input():
     global input_blocked, kb_listener, ms_listener
@@ -156,38 +168,56 @@ def unblock_input():
 
 # ── Black screen ──────────────────────────────────────────────────────────────
 
-def show_black_screen():
-    global black_window, screen_blacked
-    if screen_blacked:
-        return
-    screen_blacked = True
+def show_black_screen(text=""):
+    global screen_blacked, black_window
 
     def _create():
-        global black_window
+        global screen_blacked, black_window
+
+        if screen_blacked:
+            return
+
+        screen_blacked = True
+
         black_window = tk.Toplevel(root)
         black_window.configure(bg="black")
+
+        # Force fullscreen and frontmost
         black_window.attributes("-fullscreen", True)
         black_window.attributes("-topmost", True)
-        black_window.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        black_window.lift()
         black_window.focus_force()
 
-    root.after(0, _create)
-    print("[CLIENT] Screen BLACKED OUT")
+        label = tk.Label(
+            black_window,
+            text=text,
+            bg="black",
+            fg="white",
+            font=("Arial", 48, "bold")
+        )
+        label.place(relx=0.5, rely=0.5, anchor="center")
 
+        black_window.update_idletasks()
+        black_window.update()
+
+        print("[CLIENT] Screen BLACKED OUT")
+
+        if text:
+            black_window.after(3000, hide_black_screen)
+
+    # Schedule everything on the Tk thread
+    root.after(0, _create)
 
 def hide_black_screen():
     global black_window, screen_blacked
-    if not screen_blacked:
-        return
+
+    if black_window is not None:
+        black_window.destroy()
+        black_window = None
+
     screen_blacked = False
 
-    def _destroy():
-        global black_window
-        if black_window:
-            black_window.destroy()
-            black_window = None
-
-    root.after(0, _destroy)
     print("[CLIENT] Screen RESTORED")
 
 
@@ -196,61 +226,84 @@ def hide_black_screen():
 def handle_command(cmd: str):
     cmd = cmd.strip().upper()
     print(f"[CLIENT] Command: {cmd}")
-    if cmd == "LOCK":
-        block_input()
-    elif cmd == "UNLOCK":
-        unblock_input()
-    elif cmd == "BLACKSCREEN":
-        show_black_screen()
-    elif cmd == "RESTORESCREEN":
-        hide_black_screen()
-    elif cmd == "LOCK+BLACKSCREEN":
-        block_input()
-        show_black_screen()
-    elif cmd == "UNLOCK+RESTORESCREEN":
-        unblock_input()
-        hide_black_screen()
+    if enabled:
+        if cmd == "LOCK":
+            block_input()
+        elif cmd == "UNLOCK":
+            unblock_input()
+        elif "BLACKSCREEN" in cmd:
+            if len(cmd) > 11:
+                show_black_screen(cmd[11:].strip())
+            else:
+                show_black_screen()
+        elif cmd == "RESTORESCREEN":
+            hide_black_screen()
+        elif cmd == "RESTART":
+            appdata_path = os.environ.get("APPDATA")
+            startup_path = os.path.join(appdata_path, r"Microsoft/Windows/Start Menu/Programs/Startup")
+            os.startfile(startup_path+"/client.exe")
+            os.exit(0)
+    if "ADD_MASTER" in cmd:
+        threading.Thread(
+            target=connect_to_server,
+            args=(cmd[11:].strip(),),
+            daemon=True
+        ).start()
 
 
 # ── Network loop ──────────────────────────────────────────────────────────────
 
-def connect_loop():
+def connect_to_server(MASTER_IP):
     while True:
-        try:
-            print(f"[CLIENT] Connecting to {MASTER_IP}:{MASTER_PORT} ...")
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(10)
-            sock.connect((MASTER_IP, MASTER_PORT))
-            sock.settimeout(None)
-            print("[CLIENT] Connected to master ✓")
-
-            hostname = socket.gethostname()
-            sock.sendall(f"HELLO {hostname}\n".encode())
-
-            buf = ""
-            while True:
-                data = sock.recv(BUFFER).decode(errors="ignore")
-                if not data:
-                    print("[CLIENT] Master disconnected.")
-                    break
-                buf += data
-                while "\n" in buf:
-                    line, buf = buf.split("\n", 1)
-                    if line.strip():
-                        handle_command(line.strip())
-
-        except (ConnectionRefusedError, OSError, TimeoutError) as e:
-            print(f"[CLIENT] Connection failed ({e}). Retrying in {RECONNECT_DELAY}s ...")
-            # If we lost connection, re-check Wi-Fi too
-            ensure_wifi()
-        finally:
+        if enabled:
             try:
-                sock.close()
-            except Exception:
-                pass
+                print(f"[CLIENT] Connecting to {MASTER_IP}:{MASTER_PORT} ...")
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(10)
+                sock.connect((MASTER_IP, MASTER_PORT))
+                sock.settimeout(None)
+                print("[CLIENT] Connected to master ✓")
 
-        time.sleep(RECONNECT_DELAY)
+                hostname = socket.gethostname()
+                sock.sendall(f"HELLO {hostname}\n".encode())
 
+                buf = ""
+                while True:
+                    data = sock.recv(BUFFER).decode(errors="ignore")
+                    if not data:
+                        print("[CLIENT] Master disconnected.")
+                        break
+                    buf += data
+                    while "\n" in buf:
+                        line, buf = buf.split("\n", 1)
+                        if line.strip():
+                            handle_command(line.strip())
+
+            except (ConnectionRefusedError, OSError, TimeoutError) as e:
+                print(f"[CLIENT] Connection failed ({e}). Retrying in {RECONNECT_DELAY}s ...")
+                # If we lost connection, re-check Wi-Fi too
+                if enabled:
+                    ensure_wifi()
+            finally:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+            time.sleep(RECONNECT_DELAY)
+        else:
+            time.sleep(1)
+
+def on_activate():
+    global enabled
+    enabled = not enabled
+    onoff = "off"
+    if enabled:
+        onoff = "on"
+    else:
+        onoff = "off"
+    print("Hotkey pressed and app is " + onoff)
+    show_black_screen("App is " + onoff)
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -264,9 +317,25 @@ def main():
     root = tk.Tk()
     root.withdraw()
 
-    # Step 3 – background network thread
-    t = threading.Thread(target=connect_loop, daemon=True)
-    t.start()
+    hotkey = keyboard.HotKey(
+        keyboard.HotKey.parse('<ctrl>+<shift>+<alt>+a'),
+        on_activate
+    )
+
+    def for_canonical(f):
+        return lambda k: f(listener.canonical(k))
+
+    listener = keyboard.Listener(
+        on_press=for_canonical(hotkey.press),
+        on_release=for_canonical(hotkey.release),
+    )
+
+    for ip in MASTER_IP_LIST:
+        threading.Thread(
+            target=connect_to_server,
+            args=(ip,),
+            daemon=True
+        ).start()
 
     root.mainloop()
 

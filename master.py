@@ -110,7 +110,6 @@ def ensure_static_ip():
             "If you lose connectivity, run this app again as Administrator.",
         )
 
-
 # ── Client registry ───────────────────────────────────────────────────────────
 
 class ClientConnection:
@@ -241,6 +240,18 @@ class MasterApp(tk.Tk):
                   command=self.black_all,   **bcfg).grid(row=1, column=2, padx=4)
         tk.Button(ctrl, text="💡  Restore Screen", bg=self.ACCENT,  fg="white",
                   command=self.restore_all, **bcfg).grid(row=1, column=3, padx=4)
+        tk.Button(ctrl, text="➕ Add Master",
+          bg=self.ACCENT, fg="white",
+          command=self.add_master,
+          **bcfg).grid(row=2, column=0, padx=4, pady=6)
+        tk.Button(ctrl, text="💬 Send Message",
+                bg=self.DARK, fg="white",
+                command=self.send_message_all,
+                **bcfg).grid(row=2, column=1, padx=4, pady=6)
+        tk.Button(ctrl, text="🔁 Restart Students",
+                bg=self.DANGER, fg="white",
+                command=self.restart_app,
+                **bcfg).grid(row=2, column=2, padx=4, pady=6)
 
         ttk.Separator(self, orient="horizontal").pack(fill="x", padx=20, pady=8)
 
@@ -352,6 +363,8 @@ class MasterApp(tk.Tk):
                   command=lambda k=key: self._send(k, "BLACKSCREEN"),  **bc).pack(side="left", padx=2)
         tk.Button(btns, text="💡", bg=self.ACCENT,  fg="white",
                   command=lambda k=key: self._send(k, "RESTORESCREEN"),**bc).pack(side="left", padx=2)
+        tk.Button(btns, text="💬", bg=self.DARK,  fg="white",
+                  command=lambda k=key: self.send_message(k),**bc).pack(side="left", padx=2)
 
     # ── Commands ──────────────────────────────────────────────────────────────
 
@@ -383,11 +396,62 @@ class MasterApp(tk.Tk):
     def unlock_all(self):  self._broadcast("UNLOCK")
     def black_all(self):   self._broadcast("BLACKSCREEN")
     def restore_all(self): self._broadcast("RESTORESCREEN")
+    def send_message_all(self): self.send_message("all")
 
     def on_close(self):
         self._broadcast("UNLOCK+RESTORESCREEN")
         self.server_sock.close()
         self.destroy()
+    
+    def add_master(self):
+        win = tk.Toplevel(self)
+        win.title("Add Master IP")
+        win.geometry("300x120")
+        win.configure(bg=self.BG)
+
+        tk.Label(win, text="Enter Master IP:",
+                bg=self.BG, fg=self.FG).pack(pady=10)
+
+        entry = tk.Entry(win, width=25)
+        entry.pack(pady=5)
+
+        def submit():
+            ip = entry.get().strip()
+            if ip:
+                self._broadcast(f"ADD_MASTER {ip}")
+            win.destroy()
+
+        tk.Button(win, text="Send",
+                command=submit,
+                bg=self.ACCENT, fg="white").pack(pady=10)
+
+    def send_message(self, key="all"):
+        win = tk.Toplevel(self)
+        win.title("Send Message")
+        win.geometry("350x150")
+        win.configure(bg=self.BG)
+
+        tk.Label(win, text="Message to students:",
+                bg=self.BG, fg=self.FG).pack(pady=10)
+
+        entry = tk.Entry(win, width=40)
+        entry.pack(pady=5)
+
+        def submit():
+            msg = entry.get().strip()
+            if msg:
+                if key == "all":
+                    self._broadcast(f"BLACKSCREEN {msg}")
+                else:
+                    self._send(key, f"BLACKSCREEN {msg}")
+            win.destroy()
+
+        tk.Button(win, text="Send",
+                command=submit,
+                bg=self.ACCENT, fg="white").pack(pady=10)
+
+    def restart_app(self):
+        self._broadcast("RESTART")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
